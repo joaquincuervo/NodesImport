@@ -72,8 +72,6 @@ Backdrops follow Nuke's containment rule: they are only selected when the rubber
 
 Select any combination of nodes, Dots and Backdrops and click **Import Selected Nodes**. They land in your live Nuke session wired correctly to each other. Any inputs that point to nodes outside your selection — a Read node you already have in your comp, for example — come in disconnected, ready to wire up manually.
 
-The entire import registers as a **single undo action** — press Ctrl+Z once to undo the whole import.
-
 After importing, the status bar shows a summary with the count broken down by node type (e.g. *"✓ Imported 12 node(s): 3 Grade, 2 Merge2, 1 Blur"*).
 
 ### Expression Link Detection
@@ -107,13 +105,13 @@ If the source script uses a different color management config than your current 
 
 ### Tabs
 
-Open multiple scripts simultaneously in separate tabs. Each tab remembers its own zoom level, pan position, and selection state — switching tabs restores exactly where you left off.
+Open multiple scripts simultaneously in separate tabs.
 
 | Action | Result |
 |---|---|
-| Ctrl + T | Open a new script (reuses empty tabs) |
+| Ctrl + T | Open a new script |
 | Ctrl + W | Close the current tab |
-| Ctrl + Shift + T | Reopen the last closed tab (skips empty tabs) |
+| Ctrl + Shift + T | Reopen the last closed tab |
 | Ctrl + Tab / Ctrl + Shift + Tab | Cycle between tabs |
 | Ctrl + R or double-click tab | Rename the tab |
 | Middle-click tab | Close that tab |
