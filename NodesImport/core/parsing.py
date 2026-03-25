@@ -55,7 +55,6 @@ _ZERO_INPUT_TYPES: frozenset = frozenset({
 # ColorSpace: similarly decorative/display in some contexts.
 _STACK_EXEMPT_TYPES: frozenset = frozenset({
     "viewer",
-    "colorspace",
 })
 
 # Node types that carry no compositing meaning and should not appear in the
@@ -100,6 +99,12 @@ class NukeNode:
     # Length == input_count (always, including trailing nulls).
     parent_indices: List[int] = dataclasses.field(default_factory=list)
     index: int = 0
+    # Clone support: if this node is a clone, clone_var holds the $VAR string
+    # (e.g. "$N8c38800") referencing the original. The content field holds the
+    # raw clone block verbatim for export. clone_source_index is the parse
+    # index of the original node so the exporter can remap $VAR reliably.
+    clone_var: Optional[str] = None
+    clone_source_index: int = -1   # parse index of the cloned original (-1 if not a clone)
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +140,15 @@ def parse_nuke_script(filepath: str) -> List[NukeNode]:
     stack: List[int] = []       # Parse-time stack: stores node indices
     variables: Dict[str, int] = {}  # Named variables from `set VAR [stack N]`
 
-    node_start_re = re.compile(r"^\s*([\w.]+)\s*\{")  # [\w.]+ handles OFX dotted names e.g. OFXcom.genarts.sapphire.X
+    node_start_re  = re.compile(r"^\s*([\w.]+)\s*\{")  # [\w.]+ handles OFX dotted names
+    clone_start_re = re.compile(r"^\s*clone\s+(\$\w+)\s*\{")  # clone $VAR {
 
     current_type: Optional[str] = None
     current_lines: List[str] = []
     brace_count: int = 0
     in_string: bool = False
     node_index: int = 0
+    current_clone_var: Optional[str] = None  # set when parsing a clone block
 
     # flat_body_stack: list of NukeNode objects whose flat Group body is
     # being accumulated.
@@ -266,7 +273,28 @@ def parse_nuke_script(filepath: str) -> List[NukeNode]:
 
             # Start of a new node block
             m = node_start_re.match(line)
-            if m:
+            clone_m = clone_start_re.match(line)
+
+            if clone_m and not m:
+                # Clone block: `clone $VAR { ... }`
+                # Treat it like a regular node block but tag it with clone_var.
+                current_clone_var = clone_m.group(1)
+                current_type = "clone"
+                current_lines = [line]
+                brace_count = 0
+                in_string = False
+                brace_count, in_string = _count_braces(line, brace_count, in_string)
+                if brace_count <= 0:
+                    # One-liner clone block
+                    _finalize_clone(
+                        nodes, current_clone_var, current_lines,
+                        node_index, stack, variables,
+                    )
+                    node_index += 1
+                    current_type = None
+                    current_clone_var = None
+            elif m:
+                current_clone_var = None
                 current_type = m.group(1)
                 current_lines = [line]
                 brace_count = 0
@@ -296,26 +324,39 @@ def parse_nuke_script(filepath: str) -> List[NukeNode]:
         brace_count, in_string = _count_braces(line, brace_count, in_string)
 
         if brace_count <= 0:
-            is_flat = current_type.lower() in _FLAT_GROUP_TYPES
+            if current_clone_var is not None:
+                # Finalize a clone block
+                _finalize_clone(
+                    nodes, current_clone_var, current_lines,
+                    node_index, stack, variables,
+                )
+                node_index += 1
+                current_type = None
+                current_clone_var = None
+                current_lines = []
+                brace_count = 0
+                in_string = False
+            else:
+                is_flat = current_type.lower() in _FLAT_GROUP_TYPES
 
-            new_node = _finalize_node(
-                nodes, str(current_type), current_lines,
-                node_index, stack, variables,
-            )
+                new_node = _finalize_node(
+                    nodes, str(current_type), current_lines,
+                    node_index, stack, variables,
+                )
 
-            if (
-                is_flat
-                and new_node is not None
-                and not _has_nodes_subblock(current_lines)
-            ):
-                flat_body_stack.append(new_node)
-                flat_body_depth.append(1)
+                if (
+                    is_flat
+                    and new_node is not None
+                    and not _has_nodes_subblock(current_lines)
+                ):
+                    flat_body_stack.append(new_node)
+                    flat_body_depth.append(1)
 
-            node_index += 1
-            current_type = None
-            current_lines = []
-            brace_count = 0
-            in_string = False
+                node_index += 1
+                current_type = None
+                current_lines = []
+                brace_count = 0
+                in_string = False
 
     return nodes
 
@@ -340,6 +381,84 @@ def _count_braces(line: str, brace_count: int, in_string: bool) -> Tuple[int, bo
 def _has_nodes_subblock(lines: List[str]) -> bool:
     """Return True if this block uses Format A (contains a `nodes {` sub-block)."""
     return bool(re.search(r"^\s*nodes\s*\{", "\n".join(lines), re.MULTILINE))
+
+
+def _finalize_clone(
+    nodes: List[NukeNode],
+    clone_var: str,
+    lines: List[str],
+    index: int,
+    stack: List[int],
+    variables: Dict[str, int],
+) -> Optional[NukeNode]:
+    """
+    Handle a `clone $VAR { ... }` block.
+
+    Clones share the same type, name and parameters as their original node.
+    We look up the original via variables, copy its metadata, then give the
+    clone its own unique index, position, and content (the verbatim block).
+
+    Stack behaviour: a clone pops inputs just like a regular node would —
+    using the same input_count as the original. It then pushes itself so
+    downstream nodes connect correctly.
+    """
+    content = "\n".join(lines)
+
+    # variables dict stores keys WITHOUT the leading '$'
+    var_key = clone_var.lstrip("$")
+    original_idx = variables.get(var_key)
+    original: Optional[NukeNode] = None
+    if original_idx is not None:
+        for nd in nodes:
+            if nd.index == original_idx:
+                original = nd
+                break
+
+    # Clone blocks may declare their own `inputs N+M` (e.g. `inputs 2+1`).
+    # If present, use that; otherwise fall back to the original's input_count.
+    inputs_m = re.search(r"^\s*inputs\s+(\d+)(?:\+(\d+))?", content, re.MULTILINE)
+    if inputs_m:
+        base  = int(inputs_m.group(1))
+        extra = int(inputs_m.group(2)) if inputs_m.group(2) else 0
+        input_count = base + extra
+    elif original is not None:
+        input_count = original.input_count
+    else:
+        input_count = 1
+
+    # Extract position overrides
+    xpos_m = re.search(r"^\s*xpos\s+(-?\d+)", content, re.MULTILINE)
+    ypos_m = re.search(r"^\s*ypos\s+(-?\d+)", content, re.MULTILINE)
+    xpos = float(xpos_m.group(1)) if xpos_m else (original.xpos if original else 0.0)
+    ypos = float(ypos_m.group(1)) if ypos_m else (original.ypos if original else 0.0)
+
+    # Pop stack for inputs, push self
+    parent_indices: List[int] = [
+        stack.pop() if stack else _NULL_INPUT
+        for _ in range(input_count)
+    ]
+    stack.append(index)
+
+    # Build a display name: original name + " (clone)"
+    base_name = original.name if original else var_key
+    # Each clone gets a unique name for display; import uses the verbatim block
+    clone_name = f"{base_name} (clone)"
+
+    node = NukeNode(
+        node_type=original.node_type if original else "clone",
+        name=clone_name,
+        content=content,
+        xpos=xpos,
+        ypos=ypos,
+        tile_color=original.tile_color if original else None,
+        input_count=input_count,
+        parent_indices=parent_indices,
+        index=index,
+        clone_var=clone_var,
+        clone_source_index=original.index if original else -1,
+    )
+    nodes.append(node)
+    return node
 
 
 def _finalize_node(
